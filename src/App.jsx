@@ -120,39 +120,37 @@ function detectAnomalies(snapshots) {
   return anomalies;
 }
 
-// ─── Claude API fetch ─────────────────────────────────────────────
-async function fetchLiveData() {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 1000,
-      tools: [{ type: "web_search_20250305", name: "web_search" }],
-      messages: [{
-        role: "user",
-        content: `Search for the very latest ONPE Peru 2026 election results right now.
-Return ONLY valid JSON — no prose, no markdown fences — with this exact shape:
-{
-  "pct": <number>,
-  "actas_total": <integer>,
-  "actas_counted": <integer>,
-  "ts": <unix ms>,
-  "candidates": [
-    { "name": "<Nombre Apellido>", "party": "<partido>", "votes": <integer>, "pct": <float> }
-  ]
-}
-Include the top 9 candidates ordered by vote percentage. Use real numbers only.`,
-      }],
-    }),
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const data = await res.json();
-  const text = data.content.filter((b) => b.type === "text").map((b) => b.text).join("");
-  const clean = text.replace(/```json|```/g, "").trim();
-  const parsed = JSON.parse(clean);
+// ─── Live data fetch (via same-origin serverless proxy) ──────────
+// First try /api/onpe (direct scrape of ONPE's internal backend). That's the
+// source of truth and gives deterministic numbers, but it's gated by a flaky
+// CloudFront cache, so we fall back to /api/elections (Claude web-search proxy)
+// whenever the ONPE call can't confirm it got real JSON.
+async function tryEndpoint(url) {
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const err = await res.json();
+      if (err?.error) detail = err.error;
+    } catch {}
+    throw new Error(detail);
+  }
+  const parsed = await res.json();
   parsed.ts = parsed.ts || Date.now();
   return parsed;
+}
+
+async function fetchLiveData() {
+  try {
+    return await tryEndpoint("/api/onpe");
+  } catch (onpeErr) {
+    try {
+      const data = await tryEndpoint("/api/elections");
+      return { ...data, source: data.source ?? "claude" };
+    } catch (llmErr) {
+      throw new Error(`ONPE: ${onpeErr.message} · Claude: ${llmErr.message}`);
+    }
+  }
 }
 
 // ─── Sub-components ───────────────────────────────────────────────
@@ -204,6 +202,7 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [lastFetch, setLastFetch] = useState(null);
+  const [lastSource, setLastSource] = useState(null);
   const [autoRefresh, setAutoRefresh] = useState(false);
   const timerRef = useRef(null);
 
@@ -238,6 +237,7 @@ export default function App() {
         return updated;
       });
       setLastFetch(new Date());
+      setLastSource(snap.source ?? "onpe");
     } catch (e) {
       setError("No se pudo obtener datos en vivo. " + e.message);
     } finally {
@@ -281,6 +281,20 @@ export default function App() {
           <div style={{ fontSize: 11, color: "#888", textAlign: "right" }}>
             Última actualización<br />
             <span style={{ color: "#e0e0f0" }}>{lastFetch ? fmtTime(lastFetch) : "Datos iniciales cargados"}</span>
+            {lastSource && (
+              <span style={{
+                marginLeft: 8,
+                padding: "2px 6px",
+                borderRadius: 4,
+                fontSize: 9,
+                letterSpacing: 1,
+                background: lastSource === "onpe" ? "#0f2e28" : "#2e0f28",
+                color: lastSource === "onpe" ? "#2A9D8F" : "#E63946",
+                border: `1px solid ${lastSource === "onpe" ? "#2A9D8F" : "#E63946"}`,
+              }}>
+                {lastSource === "onpe" ? "ONPE" : "IA"}
+              </span>
+            )}
           </div>
           <button onClick={refresh} disabled={loading} style={{
             background: loading ? "#222" : "#E63946", color: "#fff",
